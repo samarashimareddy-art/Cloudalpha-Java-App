@@ -1,0 +1,47 @@
+name: CI Pipeline for Java 17 Spring Boot Maven App
+on:
+  push:
+    branches: [main]
+jobs:
+  build-test-scan:
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+      - name: Build and run unit tests
+        run: mvn -B verify
+      - name: Run SonarQube scan
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v6
+        with:
+          args: >
+            -Dsonar.projectKey=cloudalpha-java-app -Dsonar.organization=samarashimareddy-art -Dsonar.host.url=https://sonarcloud.io
+
+      - name: Run GitLeaks secret scan
+        run: |
+          curl -sSL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks detect --redact --exit-code 0 --report-path gitleaks-report.json
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Docker image (local only)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: cloudalpha-java-app:ci
+      - name: Run Trivy image scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 0 --no-progress \
+            cloudalpha-java-app:ci
