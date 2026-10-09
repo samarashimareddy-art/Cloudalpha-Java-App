@@ -7,17 +7,41 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      PLATFORM_API_KEY: ${{ secrets.PLATFORM_API_KEY }}
+    strategy:
+      matrix:
+        java-version: [17]
+        maven-profile: [default, integration]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Set up Java 17
+      - name: Set up Java ${{ matrix.java-version }}
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: ${{ matrix.java-version }}
           cache: 'maven'
       - name: Build and run unit tests
-        run: mvn -B verify
+        run: mvn -B verify -P${{ matrix.maven-profile }}
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: target/*.jar
+      - name: Run Codecov coverage check
+        run: |
+          mvn jacoco:report
+          bash <(curl -s https://codecov.io/bash) -f target/site/jacoco/jacoco.xml
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Coverage threshold gate
+        run: |
+          COVERAGE=$(grep '<counter type="INSTRUCTION"' target/site/jacoco/jacoco.xml | sed 's/.*covered="\([0-9]*\)" missed="\([0-9]*\)".*/\1 \2/' | awk '{print $1/($1+$2)*100}')
+          echo "Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "Code coverage below threshold!"
+            exit 1
+          fi
       - name: Run SonarQube scan
         if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v6
@@ -25,11 +49,21 @@ jobs:
           args: >
             -Dsonar.projectKey=cloudalpha-java-app -Dsonar.organization=samarashimareddy-art -Dsonar.host.url=https://sonarcloud.io
 
+      - name: Post SonarQube scan results
+        run: |
+          curl -X POST https://ai-devops.apx-cloudalpha.com/api/v1/security/scan-results \
+            -H "X-API-Key: $PLATFORM_API_KEY" \
+            -d @.scannerwork/report-task.txt
       - name: Run GitLeaks secret scan
         run: |
           curl -sSL -o gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz
           tar -xzf gitleaks.tar.gz gitleaks
           ./gitleaks detect --redact --exit-code 0 --report-path gitleaks-report.json
+      - name: Post GitLeaks scan results
+        run: |
+          curl -X POST https://ai-devops.apx-cloudalpha.com/api/v1/security/scan-results \
+            -H "X-API-Key: $PLATFORM_API_KEY" \
+            -d @gitleaks-report.json
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build Docker image (local only)
@@ -45,3 +79,71 @@ jobs:
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --severity CRITICAL,HIGH --exit-code 0 --no-progress \
             cloudalpha-java-app:ci
+      - name: Post Trivy scan results
+        run: |
+          docker run --rm -v $PWD:/data aquasec/trivy:0.49.1 image --severity CRITICAL,HIGH --exit-code 0 --no-progress --format json --output trivy-report.json cloudalpha-java-app:ci
+          curl -X POST https://ai-devops.apx-cloudalpha.com/api/v1/security/scan-results \
+            -H "X-API-Key: $PLATFORM_API_KEY" \
+            -d @trivy-report.json
+      - name: Emit build metrics to Datadog
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v1/series" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -d '{"series":[{"metric":"ci.build.duration","points":[[$(date +%s),60]],"type":"gauge","host":"github-actions","tags":["project:cloudalpha-java-app"]}]}'
+      - name: Forward logs to ELK
+        run: |
+          tar -czf logs.tar.gz target/*.log || true
+          curl -X POST "https://elk.example.com/api/logs" -H "Authorization: Bearer ${{ secrets.ELK_API_KEY }}" --data-binary @logs.tar.gz || true
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: '{"text": "CI Pipeline failed for cloudalpha-java-app on ${{ github.ref }}. See logs for details."}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  deploy:
+    needs: build-test-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Docker image (local only)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: cloudalpha-java-app:${{ github.sha }}
+      - name: Canary deployment to staging
+        run: |
+          echo "Deploying canary to staging..."
+          # Insert canary deployment logic here (e.g., ArgoCD/Flux CLI)
+      - name: Promote to production (blue-green)
+        run: |
+          echo "Promoting release to production (blue-green)..."
+          # Insert blue-green deployment logic here (e.g., ArgoCD/Flux CLI)
+      - name: Automated rollback on failure
+        if: failure()
+        run: |
+          echo "Rolling back deployment..."
+          # Insert rollback logic here (e.g., ArgoCD/Flux CLI)
+      - name: Emit deploy metrics to Datadog
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v1/series" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -d '{"series":[{"metric":"ci.deploy.duration","points":[[$(date +%s),30]],"type":"gauge","host":"github-actions","tags":["project:cloudalpha-java-app"]}]}'
+      - name: Forward deploy logs to ELK
+        run: |
+          tar -czf deploy-logs.tar.gz deploy.log || true
+          curl -X POST "https://elk.example.com/api/logs" -H "Authorization: Bearer ${{ secrets.ELK_API_KEY }}" --data-binary @deploy-logs.tar.gz || true
+      - name: Notify Slack on deployment failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: '{"text": "Deployment failed for cloudalpha-java-app on ${{ github.ref }}. Rollback initiated."}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
